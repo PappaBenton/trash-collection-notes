@@ -1,0 +1,44 @@
+```Config-persistence hunt```
+index=<your_citrix_index> sourcetype="citrix" "CMD_EXECUTED"
+    ("add system user" OR "bind system user" OR "epaAction"
+     OR "unbind authentication" OR "unbind vpn" OR "runningConfig"
+     OR "sec_monitor" OR ".local_journal" OR "update_result_" OR "customsnmpd"
+     OR "save ns config")
+    earliest="09/01/2026:00:00:00" latest=now
+| rex field=_raw "User\s+(?<cfg_user>[^\s]+)"
+| rex field=_raw "Remote_ip\s+(?<src_ip>[^\s]+)"
+| rex field=_raw "Command\s+\"(?<cmd>[^\"]+)\""
+| rex field=_raw "Status\s+\"(?<status>[^\"]+)\""
+| eval cmd=coalesce(cmd,_raw)
+| eval action=case(
+    match(cmd,"(?i)(add|bind) system user"),"new_admin_account",
+    match(cmd,"(?i)set authentication epaAction.*NO_AUTH"),"epa_disable",
+    match(cmd,"(?i)unbind authentication (vserver|policylabel)"),"auth_policy_unbind",
+    match(cmd,"(?i)unbind vpn (vserver|sessionPolicy)"),"vpn_policy_unbind",
+    match(cmd,"(?i)show ns runningConfig"),"config_stage",
+    match(cmd,"(?i)save ns config"),"config_save",
+    true(),"other")
+| eval hard_ioc=case(
+    match(_raw,"sec_monitor"),"acct:sec_monitor",
+    match(_raw,"\.local_journal"),"webshell:.local_journal",
+    match(_raw,"update_result_\w+\.tgz"),"exfil_archive",
+    match(_raw,"customsnmpd"),"proc:customsnmpd",
+    true(),null())
+| where action!="other" OR isnotnull(hard_ioc)
+| eval origin=if(cidrmatch("<your_WPAAS_CIDR_range>",src_ip) OR cidrmatch("<your_WPAAS_CIDR_range_2>",src_ip),"internal","external")
+| stats count
+        values(action) as action_types
+        dc(action) as distinct_actions
+        values(cmd) as commands
+        values(hard_ioc) as hard_iocs
+        values(origin) as origins
+        min(_time) as first max(_time) as last
+        by cfg_user src_ip host
+| eval sev_rank=case(
+    isnotnull(hard_iocs) OR match(mvjoin(action_types,","),"new_admin_account"),4,
+    distinct_actions>=2,3,
+    match(mvjoin(origins,","),"external"),3,
+    true(),1)
+| eval severity=case(sev_rank=4,"CRITICAL_persistence",sev_rank=3,"HIGH",true(),"REVIEW")
+| convert timeformat="%Y-%m-%d %H:%M:%S %Z" ctime(first) ctime(last)
+| sort - sev_rank first
