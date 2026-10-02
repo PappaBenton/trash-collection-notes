@@ -1,0 +1,347 @@
+Hunt — Morning Runbook (Wake-Up & Hunt)
+
+✅ THE CHECKLIST (work in order)
+Phase 0 — Confirm the data surface (gates everything below)
+	• [ ] 0.1 CONFIRM — ns.log / AAA delivery events present. Run S1. Expect pitboss delivery rows. If empty, stop and check index/sourcetype before anything else.
+	• [ ] 0.2 CONFIRM — first-seen date. Run PRE-1 (earliest-event). Confirms whether true first-seen is 9/10 vs 9/12 (round 15:00:00 may be a window clamp). Record the real earliest timestamp for CSIRT.
+	• [ ] 0.3 CONFIRM — config-audit ingest. Run PRE-2. Need cmd_executed_audit rows under citrix:netscaler:syslog. (Confirmed 10/1 — re-verify only if data pipeline changed.) Gates Bleed 4.
+	• [ ] 0.4 CONFIRM — gateway-key match. Run PRE-3. Need gateways showing surfaces=2 (both pitboss + cmd-audit tag the same host). Gates the Bleed 4 join.
+	• [ ] 0.5 CONFIRM — SSL/DTLS events ingest. Run PRE-4. NEW. Decides whether the quiet-88772 detector (H5) is runnable in Splunk or becomes an operator ask. /var/log/messages (NSPPE termination) is NOT in standard ns.log forwarding — note which half you have.
+	• [ ] 0.6 CONFIRM — web access/error log ingest. Run PRE-5. NEW. Decides whether the webshell-interaction hunt (S3) and header hunt (H6) are runnable.
+Phase 1 — Run the confirmed-surface searches (delivery + IOCs + infra)
+	• [ ] 1.1 ACTION — Baseline delivery sweep. Run S1. Record counts by wave; flag any unparsed_NEW_FORMAT.
+	• [ ] 1.2 ACTION — IOC pull. Run S2. Work exfil-flagged rows and any __NEEDS_REVIEW__ first. Diff any ?t=//hi/ tenant-string callbacks against real WPaaS identifiers (internal check) — match = possible exfil = CSIRT.
+	• [ ] 1.3 ACTION — Infra sweep. Run S4 (now includes Mandiant IPs 143.198.7.94, 157.254.167.12). Classify each hit by direction: inbound = delivery (expected), outbound = execution (escalate).
+Phase 2 — Quiet-88772 & webshell hunts (run only if their gate cleared)
+	• [ ] 2.1 ACTION (if 0.5 cleared) — DTLS exploit-pattern hunt. Run H5. A SSL_HANDSHAKE_FAILURE / DTLSv1.0 / Internal Error followed within minutes by an NSPPE termination on the same appliance = high-confidence 88772 exploitation. This is the signal H3 could not reach. Escalate any correlated pair.
+	• [ ] 2.2 ACTION (if 0.6 cleared) — Webshell interaction hunt. Run S3. 404s with multi-KB bodies / long processing on /vpn/media/*.ico or /vpn/scripts/ = WHIPSHOT-style read-back. Confirm no legit receiver.min.css/.ico ships by that name first.
+	• [ ] 2.3 ACTION (if 0.6 cleared) — C2-header hunt. Run H6. Requests carrying HTTP_NSC_LDAP, HTTP_NSC_CLIENTTYPE, or HTTP_X_UX* headers = webshell C2 channel.
+Phase 3 — Persistence detection & review sweeps
+	• [ ] 3.1 ACTION — New-account detection (Bleed 4). Run Bleed 4 detection-only. Any new system account is alert-worthy (baseline ~zero). Privileged + external = top. Record pitboss_lag_hours on any hit (feeds go-live window tuning).
+	• [ ] 3.2 ACTION — First-ever-login sweep (Angle B). Run S-B (review-only). Work REVIEW_HIGH_external_first_login first. Baseline against known accounts before believing any hit.
+	• [ ] 3.3 REVIEW — ${jndi vector. 128 events seen in CMD_EXECUTED user field (10/1). Decide: quick standalone check or fold into entropy sweep. Second injection vector, separate from pitboss.
+Phase 4 — Operator-side (hand off; cannot run in Splunk)
+	• [ ] 4.1 ACTION — Send operator ask (OPERATOR-ASK block below). Bundles all on-box IOCs, Mandiant grep commands, egress target list, DTLS//var/core requests, and session/credential rotation items.
+	• [ ] 4.2 ACTION — Provide GTIG YARA (WHIPSHOT, SLAPSHOT, config, C2-header, persistence rules — in YARA block) to whoever can scan the appliance filesystem / EDR. These are file-scan rules, not SPL.
+Phase 5 — The open active hunt (the reason the hunt exists)
+	• [ ] 5.1 CONFIRM — ICAUUID extraction (H4a Step 0). Run H4a-STEP0. Need clean state, single length, user present. Fix extraction before the main run or replay hides in split groups.
+	• [ ] 5.2 ACTION — H4a session replay. Run H4a. Session established through a hit gateway later appearing from a non-WPaaS origin. This is the delivery→session-abuse bridge; Mandiant confirms in-campaign credential/session theft, so treat as live.
+
+📂 SEARCH LIBRARY
+PRE-1 — Earliest-event confirmation (checklist 0.2)
+index=<your_citrix_index> ("pitboss PPE" OR "pitboss%20PPE") NSPPE earliest="09/01/2026:00:00:00" latest="10/01/2026:23:59:59"
+| rex field=_raw "(?:login claims for user|parsed data; username:) <(?<payload>pitboss PPE.+?)>(?:,? pwdlen| with configured schema)"
+| where isnotnull(payload)
+| sort _time | head 5
+| table _time host payload
+PRE-2 — Config-audit ingest check (checklist 0.3)
+index=<your_citrix_index> sourcetype="citrix:netscaler:syslog" "CMD_EXECUTED" earliest=-7d
+| stats count values(sourcetype) as st min(_time) as first max(_time) as last by host
+Need rows. Confirms add system user / epaAction / unbind would be visible if they occurred.
+PRE-3 — Gateway-key match (checklist 0.4)
+index=<your_citrix_index> sourcetype="citrix:netscaler:syslog"
+    (("pitboss PPE" NSPPE) OR "CMD_EXECUTED") earliest=-7d latest=now
+| eval surface=if(match(_raw,"pitboss PPE") AND match(_raw,"NSPPE"),"pitboss_delivery","cmd_audit")
+| stats dc(surface) as surfaces values(surface) as seen count by host
+| sort - count
+Need surfaces=2.
+PRE-4 — SSL/DTLS ingest check (checklist 0.5, NEW)
+index=<your_citrix_index> sourcetype="citrix:netscaler:syslog"
+    ("SSL_HANDSHAKE_FAILURE" OR "SSLLOG" OR "DTLS" OR "NSPPE" OR "orphan rings" OR "NOT restarting")
+    earliest=-7d
+| eval kind=case(
+    match(_raw,"SSL_HANDSHAKE_FAILURE"),"ssl_handshake_fail",
+    match(_raw,"DTLS"),"dtls_event",
+    match(_raw,"orphan rings|NOT restarting NSPPE"),"nsppe_termination",
+    true(),"other")
+| stats count values(sourcetype) as st min(_time) as first max(_time) as last by kind
+ssl_handshake_fail / dtls_event present → H5 runnable. nsppe_termination absent → /var/log/messages not forwarded → that half is an operator ask.
+PRE-5 — Web log ingest check (checklist 0.6, NEW)
+index=<your_citrix_index> ("httpaccess" OR "httperror" OR "/vpn/media/" OR "/vpn/scripts/") earliest=-24h
+| head 50
+| rex field=_raw "(?<uri>/vpn/[^\s\"?]+)"
+| rex field=_raw "\s(?<status>[2-5]\d\d)\s"
+| stats count values(sourcetype) as st dc(uri) as uris by status
+uri/status populate → S3 and H6 runnable.
+
+S1 — Baseline Delivery Sweep (CVE-2026-88771)
+Confirms/quantifies injection delivery. Anchors on the structural marker "pitboss PPE" NSPPE (not the crash phrase — it tokenizes inconsistently). Handles both AAA formats, URL-encoding, truncation, and splits zero-day vs post-disclosure waves.
+index=<your_citrix_index> ("pitboss PPE" OR "pitboss%20PPE") NSPPE earliest="09/01/2026:00:00:00" latest="10/01/2026:23:59:59"
+| rex field=_raw "(?:login claims for user|parsed data; username:) <(?<payload>pitboss PPE.+?)>(?:,? pwdlen| with configured schema)"
+| rex field=_raw "(?:login|User-Agent)[=:]\s?(?<payload2>pitboss(?:%20| )PPE.+?)(?:&(?:passwd|pwd)|&nsg|\r|$)"
+| eval payload=coalesce(payload,payload2)
+| eval payload=if(match(payload,"%[0-9A-Fa-f]{2}"),urldecode(payload),payload)
+| eval has_terminator=if(match(_raw,"pitboss PPE.+?>"),1,0)
+| eval delivery=case(isnotnull(payload),"parsed",
+                     match(_raw,"%20PPE|%3B|%24%7BIFS%7D"),"encoded_http_log",
+                     has_terminator=0,"truncated_no_payload",
+                     true(),"unparsed_NEW_FORMAT")
+| eval payload=coalesce(payload,"__".delivery."__")
+| eval wave=if(_time>=strptime("2026-09-27","%Y-%m-%d"),"post_disclosure","zero_day")
+| stats count min(_time) as first max(_time) as last values(host) as gateways dc(host) as hosts by payload delivery wave
+| convert timeformat="%Y-%m-%d %H:%M:%S %Z" ctime(first) ctime(last)
+| sort wave first
+Read: unparsed_NEW_FORMAT>0 = new delivery path (sample → build rex). truncated_no_payload = operator ns.log ask (long stagers cut at ~185B syslog limit). Prior result: zero-day = single PHP dead-drop shape, first-seen ~9/10–9/12.
+
+S2 — IOC Pull
+Extracts intended callbacks/hosts/files per payload; no-callback payloads self-label into technique buckets. IOCs are delivery-side intent until egress confirms a connection.
+index=<your_citrix_index> ("pitboss PPE" OR "pitboss%20PPE") NSPPE earliest="09/01/2026:00:00:00" latest="10/01/2026:23:59:59"
+| rex field=_raw "(?:login claims for user|parsed data; username:) <(?<payload>pitboss PPE.+?)>(?:,? pwdlen| with configured schema)"
+| rex field=_raw "(?:login|User-Agent)[=:]\s?(?<payload2>pitboss(?:%20| )PPE.+?)(?:&(?:passwd|pwd)|&nsg|\r|$)"
+| eval payload=coalesce(payload,payload2)
+| eval payload=if(match(payload,"%[0-9A-Fa-f]{2}"),urldecode(payload),payload)
+| where isnotnull(payload)
+| rex field=payload "(?<url>https?://[^\s'\"]+)"
+| rex field=payload "(?<oast>[a-z0-9][a-z0-9.-]*\.(?:oast\.(?:fun|pro|site|live|me)|interactsh\.com|burpcollaborator\.net|dnslog\.cn|dnsl\.cc|requestbin\.net|pipedream\.net|canarytokens\.com))"
+| rex field=payload "(?:curl|wget|fetch|nslookup|dig|host|nc|ncat|telnet)\s+(?:-{1,2}[a-zA-Z][\w-]*(?:[= ]\S+)?\s+)*(?<cb_host>[a-zA-Z0-9][a-zA-Z0-9.-]+\.[a-zA-Z]{2,})"
+| rex field=payload "(?<gsocket_secret>\b[a-f0-9]{32}\b)"
+| rex field=payload "(?<deaddrop_tag>\b(?:C3|KP):)"
+| rex field=payload "(?<marker>nx_verify\.html|admin_ui/log\.txt|\.ctxs\.receiver|xua\.html|insight-new\.js|\.sig|nsginstaller|nsgclient)"
+| rex field=payload "(?<file_ioc>/(?:var|netscaler|flash|usr)/[^\s'\";|>]+)"
+| rex field=payload "(?:^|;|\|)\s*(?<cmd_ioc>(?:id|whoami|uname|hostname|cat|chmod|tar|nc|ncat)\b[^;|]*)"
+| eval net_ioc=case(
+    isnotnull(url),url, isnotnull(oast),oast, isnotnull(cb_host),cb_host,
+    match(payload,"\bz?grep\b.{0,15}/var/log"),"__DEADDROP_logfile__",
+    match(payload,"\|\s?php\b"),"__DEADDROP_php__",
+    isnotnull(deaddrop_tag),"__DEADDROP_tag__",
+    isnotnull(marker),"__MARKER_only__",
+    match(payload,"\bid\b|whoami"),"__RECON_only__",
+    true(),"__NO_IOC_UNCLASSIFIED__")
+| eval ioc_display=coalesce(url, oast, cb_host, file_ioc, cmd_ioc, "__NEEDS_REVIEW__")
+| rex max_match=0 field=net_ioc "(?<embedded_ip>\b(?:\d{1,3}\.){3}\d{1,3}\b)"
+| eval exfil_flag=if((isnotnull(url) AND (match(url,"\?\S*=\S") OR match(url,"://[^/]+/\w+/\S"))),"EXFIL_SHAPE_review",null())
+| eval technique=mvappend(
+    case(match(payload,"--no-verify-(peer|hostname)"),"tls_bypass"),
+    case(match(payload,"\$\{?IFS\}?"),"ifs_evasion"),
+    case(match(payload,"\bz?grep\b.{0,15}/var/log"),"logfile_deaddrop"),
+    case(match(payload,"\|\s?php\b"),"php_stage2"),
+    case(match(payload,"\bnc\s+\S+\s+\d+\s+-e"),"reverse_shell"),
+    case(match(payload,"\bpython\S*\s+/var|\.py\b"),"python_stager"),
+    case(isnotnull(gsocket_secret),"gsocket:".gsocket_secret),
+    case(isnotnull(deaddrop_tag),"log_deaddrop_tag"),
+    case(isnotnull(marker),"marker_write:".marker))
+| eval wave=if(_time>=strptime("2026-09-27","%Y-%m-%d"),"post_disclosure","zero_day")
+| stats count min(_time) as first max(_time) as last dc(payload) as distinct_payloads values(net_ioc) as bucket values(embedded_ip) as embedded_ips values(exfil_flag) as exfil values(technique) as techniques dc(host) as hosts values(host) as gateways by ioc_display wave
+| convert timeformat="%Y-%m-%d %H:%M:%S %Z" ctime(first) ctime(last)
+| sort - count
+Read: exfil populated = data-bearing callback (priority). __NEEDS_REVIEW__ = nothing extracted (hand-review; should be tiny). (Marker regex updated with Mandiant .sig/nsginstaller/nsgclient names.)
+
+S4 — Threat-Actor Infrastructure Sweep (updated: +Mandiant IPs)
+Yes/no presence of known-bad infra. Direction = severity: source hitting gateway = inbound delivery; gateway reaching out = execution (escalate).
+index=<your_citrix_index> earliest="09/01/2026:00:00:00" latest="10/01/2026:23:59:59"
+    ("23.132.164.35" OR "78.128.113.10" OR "149.104.78.141" OR "199.233.217.13"
+     OR "23.27.143.20" OR "158.94.209.12" OR "173.255.61.40"
+     OR "130.94.42.226" OR "130.94.20.222" OR "45.141.21.130"
+     OR "64.94.85.67" OR "31.56.197.72" OR "143.198.7.94" OR "157.254.167.12"
+     OR "dnsl.cc" OR "ddns.1433.eu.org" OR "oast.pro" OR "oast.fun" OR "gsocket.io")
+| eval matched_ioc=mvappend(
+    if(match(_raw,"(?<![\d.])23\.132\.164\.35(?![\d.])"),"23.132.164.35",null()),
+    if(match(_raw,"(?<![\d.])78\.128\.113\.10(?![\d.])"),"78.128.113.10",null()),
+    if(match(_raw,"(?<![\d.])149\.104\.78\.141(?![\d.])"),"149.104.78.141",null()),
+    if(match(_raw,"(?<![\d.])199\.233\.217\.13(?![\d.])"),"199.233.217.13",null()),
+    if(match(_raw,"(?<![\d.])23\.27\.143\.20(?![\d.])"),"23.27.143.20",null()),
+    if(match(_raw,"(?<![\d.])158\.94\.209\.12(?![\d.])"),"158.94.209.12",null()),
+    if(match(_raw,"(?<![\d.])173\.255\.61\.40(?![\d.])"),"173.255.61.40",null()),
+    if(match(_raw,"130\.94\.42\.226"),"130.94.42.226",null()),
+    if(match(_raw,"130\.94\.20\.222"),"130.94.20.222",null()),
+    if(match(_raw,"45\.141\.21\.130"),"45.141.21.130",null()),
+    if(match(_raw,"64\.94\.85\.67"),"64.94.85.67",null()),
+    if(match(_raw,"31\.56\.197\.72"),"31.56.197.72",null()),
+    if(match(_raw,"(?<![\d.])143\.198\.7\.94(?![\d.])"),"143.198.7.94",null()),
+    if(match(_raw,"(?<![\d.])157\.254\.167\.12(?![\d.])"),"157.254.167.12",null()),
+    if(match(_raw,"dnsl\.cc"),"dnsl.cc",null()),
+    if(match(_raw,"ddns\.1433\.eu\.org"),"ddns.1433.eu.org",null()),
+    if(match(_raw,"oast\.pro"),"oast.pro",null()),
+    if(match(_raw,"oast\.fun"),"oast.fun",null()),
+    if(match(_raw,"gsocket\.io"),"gsocket.io",null()))
+| stats count min(_time) as first max(_time) as last values(sourcetype) as sourcetypes dc(host) as gateways values(host) as gateway_list by matched_ioc
+| convert timeformat="%Y-%m-%d %H:%M:%S %Z" ctime(first) ctime(last)
+| sort - count
+Provenance: GreyNoise/Defused, LevelBlue, ORG S2 pulls, and (new) Mandiant 143.198.7.94 (scan/stage) + 157.254.167.12 (exploit/install). 130.94.0.0/16 CIDR sweep pending egress-field confirmation.
+
+H3 — Crash-Storm Isolation (CVE-2026-88772) — COMPLETE (valid negative)
+index=<your_citrix_index> pitboss ("unexpectedly died" OR "missed too many heartbeats")
+  NOT ("login claims for user" OR "LOGIN REQ: parsed data")
+| stats count
+Zero genuine crashes — all volume is 88771 injection noise. Scope: clears only the crash-storm signal in syslog. Quiet-88772 RCE now addressed by H5 (below), which is the better test.
+
+H5 — DTLS Exploit-Pattern → NSPPE Termination (CVE-2026-88772, NEW)
+Runnable only if PRE-4 shows SSL/DTLS events. Mandiant: successful 88772 produces a SSL_HANDSHAKE_FAILURE / DTLSv1.0 / Internal Error, and (in /var/log/messages) an NSPPE termination (orphan rings, pitboss … NOT restarting NSPPE). The high-confidence signal is the two correlated within minutes on one appliance.
+index=<your_citrix_index> sourcetype="citrix:netscaler:syslog"
+    ("SSL_HANDSHAKE_FAILURE" OR "orphan rings" OR "NOT restarting NSPPE")
+    earliest="09/01/2026:00:00:00" latest="10/01/2026:23:59:59"
+| eval sig=case(
+    match(_raw,"SSL_HANDSHAKE_FAILURE") AND match(_raw,"DTLSv1\.0") AND match(_raw,"Internal Error"),"dtls_exploit_pattern",
+    match(_raw,"orphan rings") OR match(_raw,"NOT restarting NSPPE"),"nsppe_termination",
+    true(),"other")
+| where sig!="other"
+| bin _time span=5m
+| stats values(sig) as signals dc(sig) as sig_types count values(_raw) as samples by host _time
+| where sig_types>1 OR match(mvjoin(signals,","),"dtls_exploit_pattern")
+| eval severity=if(sig_types>1,"CRITICAL_dtls_plus_nsppe_crash","HIGH_dtls_pattern")
+| convert timeformat="%Y-%m-%d %H:%M:%S %Z" ctime(_time)
+| sort - severity _time
+Read: CRITICAL = handshake failure + NSPPE termination in the same 5-min bin on one appliance → strong 88772 exploitation. If NSPPE-termination lines are absent (PRE-4), you only have the DTLS half — the termination half is an operator /var/log/messages ask.
+
+S3 — Webshell Interaction / Read-Back (NEW/expanded)
+Runnable only if PRE-5 shows web logs. Mandiant webshells return spoofed 404s with multi-KB bodies on /vpn/media/*.ico → .sig. Behavior, not path, is the tell.
+index=<your_citrix_index> ("/vpn/media/" OR "/vpn/scripts/" OR "/vpn/theme/" OR ".sig" OR ".ctxs.receiver" OR "receiver.min" OR "nx_verify.html")
+    earliest="09/01/2026:00:00:00" latest="10/01/2026:23:59:59"
+| rex field=_raw "(?<uri>/vpn/[^\s\"?]+|/netscaler/[^\s\"?]+)"
+| rex field=_raw "\s(?<status>[2-5]\d\d)\s(?<resp_bytes>\d+)"
+| rex field=_raw "\s(?<src_ip>\d{1,3}\.\d{1,3}\.\d{1,3}\.\d{1,3})\s"
+| eval flag=case(
+    match(uri,"\.sig$") OR match(uri,"/vpn/media/.*\.ico$"),"WEBSHELL_sig_or_ico",
+    match(uri,"\.ctxs\.receiver|receiver\.min(\.[0-9a-f]+)?\.css"),"WEBSHELL_readback",
+    match(uri,"nx_verify\.html|admin_ui/log\.txt"),"MARKER_readback",
+    true(),"other")
+| eval big_404=if(status="404" AND resp_bytes>5000,"spoofed_404_large_body",null())
+| where flag!="other" OR isnotnull(big_404)
+| stats count min(_time) as first max(_time) as last values(status) as statuses max(resp_bytes) as max_bytes values(src_ip) as src_ips by uri flag big_404 host
+| convert timeformat="%Y-%m-%d %H:%M:%S %Z" ctime(first) ctime(last)
+| sort - count
+Read: spoofed_404_large_body on /vpn/media/|/vpn/scripts/ = WHIPSHOT-style C2 read-back = execution. First confirm no legit NetScaler asset ships a real receiver.min.css / nsgclient.ico.
+
+H6 — Webshell C2 Header Hunt (NEW)
+Runnable only if PRE-5 shows web logs with headers. The webshells read Base64 commands from custom headers.
+index=<your_citrix_index> ("HTTP_NSC_LDAP" OR "HTTP_NSC_CLIENTTYPE" OR "NSC_LDAP" OR "NSC_CLIENTTYPE" OR "HTTP_X_UX" OR "NSC_USER" OR "NSC_NONCE")
+    earliest="09/01/2026:00:00:00" latest="10/01/2026:23:59:59"
+| rex field=_raw "(?<c2_header>HTTP_X_UX(?:_\d+)?|HTTP_NSC_[A-Z]+|NSC_[A-Z]+)"
+| rex field=_raw "(?<src_ip>\d{1,3}\.\d{1,3}\.\d{1,3}\.\d{1,3})"
+| stats count min(_time) as first max(_time) as last values(c2_header) as headers values(src_ip) as src_ips dc(src_ip) as distinct_src by host
+| convert timeformat="%Y-%m-%d %H:%M:%S %Z" ctime(first) ctime(last)
+| sort - count
+Read: any hit = webshell C2 channel present. HTTP_X_UX* = WHIPSHOT specifically. These headers are non-standard — presence alone is high-signal.
+
+Bleed 4 — New System Account Detection (detection-only)
+Fires on any new NetScaler system account (baseline ~zero). Privilege = discriminator; pitboss delivery = non-gating context. MITRE T1136.001. (Full pre-live gates in Notes.)
+index=<your_citrix_index> sourcetype="citrix:netscaler:syslog" "CMD_EXECUTED"
+    ("add system user" OR "bind system user")
+    earliest="09/01/2026:00:00:00" latest="10/01/2026:23:59:59"
+| rex field=_raw "User\s+(?<ran_by>\S+)"
+| rex field=_raw "ADM_User\s+(?<adm_user>\S+)"
+| rex field=_raw "Remote_ip\s+(?<src_ip>\S+)"
+| rex field=_raw "Command\s+\"(?<cmd>[^\"]+)\""
+| rex field=_raw "Status\s+\"(?<status>[^\"]+)\""
+| rex field=cmd "(?i)add system user\s+(?<added_user>\S+)"
+| rex field=cmd "(?i)bind system user\s+(?<bound_user>\S+)\s+(?<bound_policy>\S+)"
+| eval acct_user=coalesce(added_user,bound_user)
+| where isnotnull(acct_user) AND acct_user!="propagate"
+| eval priv_bind=if(match(bound_policy,"(?i)superuser|operator|sysadmin"),bound_policy,null())
+| stats min(_time) as first_event max(_time) as last_event
+        values(cmd) as commands values(ran_by) as ran_by values(adm_user) as adm_users
+        values(src_ip) as src_ips values(bound_policy) as bound_policies
+        values(priv_bind) as priv_policies values(status) as statuses
+        by acct_user host
+| join type=left host [
+    search index=<your_citrix_index> sourcetype="citrix:netscaler:syslog" "pitboss PPE" NSPPE
+        earliest="09/01/2026:00:00:00" latest="10/01/2026:23:59:59"
+    | stats latest(_time) as last_pitboss count as pitboss_total by host ]
+| eval pitboss_context=if(isnotnull(last_pitboss) AND (first_event-last_pitboss)>=0 AND (first_event-last_pitboss)<=172800,
+    "pitboss_delivery_prior_48h","none_in_48h")
+| eval pitboss_lag_hours=if(pitboss_context="pitboss_delivery_prior_48h",round((first_event-last_pitboss)/3600,1),null())
+| eval origin=if(cidrmatch("<your_WPAAS_CIDR_range>",mvindex(src_ips,0)) OR cidrmatch("<your_WPAAS_CIDR_range_2>",mvindex(src_ips,0)),"internal","external")
+| eval has_bind=if(match(mvjoin(commands,"; "),"(?i)bind system user"),"bound","UNBOUND_add_only")
+| eval severity=case(
+    mvcount(priv_policies)>0 AND origin="external","CRITICAL_priv_account_external",
+    mvcount(priv_policies)>0,"CRITICAL_priv_account",
+    origin="external","HIGH_new_account_external",
+    true(),"HIGH_new_account")
+| eval severity=if(pitboss_context="pitboss_delivery_prior_48h","+".severity,severity)
+| eval account_seen=strftime(first_event,"%Y-%m-%d %H:%M:%S %Z")
+| table account_seen host severity acct_user has_bind bound_policies ran_by adm_users src_ips origin statuses pitboss_context pitboss_lag_hours commands
+| sort - severity account_seen
+Pre-live gates (4): PRE-3 host-key verified · 7-day FP baseline clean or known-admin suppression built · positive control fires (lab DAG delivery + test add system user) · pitboss_lag_hours read off a real pair to right-size window. Go-live toggle: add | where last_event >= relative_time(now(),"-30m"), tighten earliest to -48h, attach alert. Lookback (48h) and detection latency (run q15–30m) are independent.
+
+S-B — First-Ever-Login Sweep (Angle B, review-only)
+Catches an account whose first login via a hit gateway comes after exposure — stolen cred, pre-existing, or off-audit account. Not an alert (first-logins are noisy).
+index=<your_citrix_index> sourcetype="citrix:netscaler:syslog"
+    (("pitboss PPE" NSPPE) OR "Login_success" OR "LOGIN: User")
+    earliest="09/01/2026:00:00:00" latest="10/01/2026:23:59:59"
+| eval event_type=case(
+    match(_raw,"pitboss PPE") AND match(_raw,"NSPPE"),"pitboss_delivery",
+    match(_raw,"(?i)login_success|LOGIN: User"),"login", true(),"other")
+| where event_type!="other"
+| rex field=_raw "(?i)(?:User|user:)\s+(?<login_user>[^\s,\"]+)"
+| rex field=_raw "(?:Client_ip|Remote_ip|from)\s+(?<src_ip>\d{1,3}\.\d{1,3}\.\d{1,3}\.\d{1,3})"
+| sort 0 _time
+| streamstats min(eval(if(event_type="pitboss_delivery",_time,null()))) as gw_first_pitboss by host
+| where event_type="login" AND isnotnull(login_user)
+| stats min(_time) as first_login max(_time) as last_login count as login_count
+        values(src_ip) as src_ips dc(src_ip) as distinct_src min(gw_first_pitboss) as gw_first_pitboss
+        by login_user host
+| where isnotnull(gw_first_pitboss) AND first_login >= gw_first_pitboss
+| eval origin=if(cidrmatch("<your_WPAAS_CIDR_range>",mvindex(src_ips,0)) OR cidrmatch("<your_WPAAS_CIDR_range_2>",mvindex(src_ips,0)),"internal","external")
+| eval hours_after_pitboss=round((first_login-gw_first_pitboss)/3600,1)
+| eval review_flag=case(
+    origin="external","REVIEW_HIGH_external_first_login",
+    distinct_src>=3,"REVIEW_MED_multi_source",
+    true(),"REVIEW_new_login_post_pitboss")
+| eval first_login_str=strftime(first_login,"%Y-%m-%d %H:%M:%S %Z")
+| convert timeformat="%Y-%m-%d %H:%M:%S %Z" ctime(gw_first_pitboss)
+| table first_login_str host review_flag login_user origin src_ips distinct_src login_count hours_after_pitboss gw_first_pitboss last_login
+| sort - review_flag first_login_str
+Preflight: confirm the successful-login event token + username/IP parse (naming varies by build) or it silently zeros. Caveat: "first-ever" = first in-window; with <90d retention, baseline against known accounts before believing a hit.
+
+H4a — Session Replay / Source-IP Drift (the open active hunt)
+H4a-STEP0 — ICAUUID extraction validation (run first):
+index=<your_citrix_index> (ICASTART OR ICAEND_CONNSTAT) earliest="09/01/2026:00:00:00" latest="10/01/2026:23:59:59"
+| eval uuid_state=case(isnull(ICAUUID),"NULL", match(ICAUUID,"[\s,;\"'\[\]]"),"DIRTY", true(),"clean")
+| eval uuid_len=len(ICAUUID), user_state=if(isnull(user),"NULL","present")
+| stats count by uuid_state uuid_len user_state
+Need clean, single uuid_len, user present. If DIRTY/multi-length → fix extraction (replay hides in split groups). If user NULL → field has another name; swap before H4b.
+H4a — main run:
+index=<your_citrix_index> (ICASTART OR ICAEND_CONNSTAT) earliest="09/01/2026:00:00:00" latest="10/01/2026:23:59:59"
+| where isnotnull(ICAUUID) AND isnotnull(src_ip)
+| eval zone=case(cidrmatch("<your_WPAAS_CIDR_range>",src_ip),"wpaas_test", cidrmatch("<your_WPAAS_CIDR_range_2>",src_ip),"wpaas_tenant", true(),"external")
+| eval origin=if(zone="external","external","internal")
+| eval zone_ip=zone.":".src_ip
+| stats count as events
+        count(eval(origin="external")) as ext_events
+        dc(origin) as origins
+        min(eval(if(origin="internal",_time,null()))) as first_internal
+        min(eval(if(origin="external",_time,null()))) as first_external
+        max(_time) as last
+        values(zone_ip) as zone_ips values(user) as users values(host) as gateways
+        by ICAUUID
+| where origins>1
+| eval sequence=case(first_internal<first_external,"int_then_ext", first_external<first_internal,"ext_then_int", true(),"same_second")
+| eval gap_min=round(abs(first_external-first_internal)/60,1)
+| eval period=if(first_external>=strptime("2026-09-12","%Y-%m-%d"),"post_injection","baseline")
+| convert timeformat="%Y-%m-%d %H:%M:%S %Z" ctime(first_internal) ctime(first_external) ctime(last)
+| sort 0 -period first_external
+Read: strongest replay = post_injection + int_then_ext + low ext_events + short gap_min. Keep enterprise-wide (not just pitboss gateways) — CitrixBleed-2 token theft leaves no injection payload. Mandiant confirms in-campaign session/credential theft, so treat as live. If zero: verify external appears in data (else cidrmatch is misfiring) before banking it.
+
+OPERATOR-ASK BLOCK (checklist 4.1 — appliance-side, cannot run in Splunk)
+Mandiant grep commands (run on each appliance):
+grep -En -i "application/x-httpd-php|php_flag|AliasMatch" /etc/httpd.conf
+file /var/netscaler/gui/vpn/scripts/linux/* /var/netscaler/gui/vpns/scripts/vista/* /var/netscaler/gui/vpns/scripts/mac/* /netscaler/ns_gui/vpn/media/* 2>/dev/null | grep -E "ASCII text|PHP script"
+grep -rlE "<\?php|eval\(|base64_decode\(|shell_exec\(" /var/netscaler/gui/ /netscaler/ns_gui/ /var/vpn/ /netscaler/portal/ 2>/dev/null
+grep -E -i "\.(deb|sig|rpm|tgz|sh|so|dat|ico|png|html)" /var/log/httperror*
+ls -l /bin/sh            # -rwsr-xr-x = SUID backdoor
+ls -la /tmp/.uxdport* /tmp/.uxdlock   # SLAPSHOT artifacts
+ps aux | grep -E "python.*(\.uxd|uxdport|uxdlock|base64)"
+Also run: Citrix's built-in IOC Scanner (NetScaler Console).
+On-disk IOCs to confirm: .ctxs.receiver (SHA-256 6f5a2a452a7901323abd21879c6cecccb47c06aeeaccb1b467212f3b11e4b1e7), .local_journal, xua.html, insight-new.js, nsginstaller*.deb, nsgclient*.sig, e6ee7c85.sig, /tmp/.uxdport, /tmp/.uxdlock, /var/tmp/c1.txt/c2.txt/labels.txt, /tmp/update_result_*.tgz, /var/1.py, main.py, update_c08937.pl; /bin/sh SUID/6555.
+Config: unauthorized AddHandler ... .deb/.sig, AliasMatch /vpn/media/*.ico → .sig, php_flag engine on in /etc/httpd.conf / /nsconfig/httpd.conf / /flash/nsconfig/httpd.conf; any admin/system account not in baseline (esp. sec_monitor); EPA NO_AUTH; unbound auth/VPN policies.
+Egress/DNS (execution proof — any outbound hit = executed): IPs 157.254.167.12, 143.198.7.94, 45.141.21.130, 64.94.85.67, 31.56.197.72, 23.27.143.20, 199.233.217.13, 158.94.209.12, 173.255.61.40, 130.94.42.226, 130.94.20.222, 149.104.78.141, 23.132.164.35, 78.128.113.10; domains *.oast.pro, *.oast.fun, dnsl.cc, ddns.1433.eu.org, gsocket.io. Block outbound SMTP/25.
+88772 forensics: DTLS listener logs, /var/log/messages (NSPPE termination — not in ns.log forwarding), /var/core inventory, NSPPE restart history. Preserve before patch/reboot: full VM snapshot with memory, Console logs, tech-support bundle, packet-engine core dump.
+Logging gaps to close (Mandiant — not forwarded by default): /var/log/messages, httpaccess.log, httperror*, SSL events in ns.log, firewall/flow logs for NSIP/SNIP, PAM audit logs.
+Post-patch (patch ≠ clean): revoke admin/Gateway/VPN + ICA/HDX sessions; rotate admin creds, local accounts, SSH keys, TLS certs/keys, LDAP/RADIUS/TACACS/SNMP/NITRO secrets; halt HA sync until both nodes validated; audit StoreFront/DDC/VDA hosts for lateral movement. Confirm CitrixBleed-2 (CVE-2025-5777) patch status + whether sessions were force-killed after each patch.
+
+GTIG YARA RULES (checklist 4.2 — file-scan, NOT Splunk; hand to appliance/EDR scanning)
+Available in the Mandiant/GTIG report: G_APT_Backdoorwebshell_WHIPSHOT_1, G_APT_Tunneler_SLAPSHOT_1, G_Hunting_Config_NetScaler_PHP_1, G_Hunting_Backdoorwebshell_NetScaler_C2Headers_1, G_Hunting_Script_NetScaler_Persistence_1. Key strings: HTTP_X_UX, /tmp/.uxdport, /tmp/.uxdlock, UXD_IDLE_EXIT, wire verbs (open/push/pull/exch/close/ping), chmod u+s /bin/sh, nsshutdown -R, AddHandler application/x-httpd-php. Google SecOps "Mandiant Frontline Threats" pack has equivalent rules if you run Chronicle.
+
+KNOWN-GOOD CARVE-OUTS (never count as attacker activity)
+	• propagate — HA config-sync pseudo-user (suppressed).
+	• nsroot — default superuser; benign by action, escalate only on suspicious command.
+	• wpaasadmin — confirmed benign (login-only, resolved 10/1).
+	• watchTowr DAG test markers — command id>/var/tmp/watchTowr, files /var/tmp/watchTowr//var/tmp/boom = research/lab validation.
+OPEN ITEMS / STATE
+	• DONE: S1 (delivery confirmed), S2 (IOCs), H3 (crash-storm neg), S5 (config-persistence neg — both gateways), S4 (staged), Bleed 4 (built, detection-only), S-B (built).
+	• NEW & QUEUED: H5 (DTLS/88772), S3 (webshell interaction), H6 (C2 headers) — all gated on ingest checks PRE-4/PRE-5.
+	• OPEN ACTIVE HUNT: H4a (session replay) — gated on H4a-STEP0.
+	• LOOSE THREADS: ${jndi (128, second vector → entropy sweep); first-seen 9/12→9/10 confirm (PRE-1); 130.94.0.0/16 CIDR sweep pending egress-field name.
+	• ATTRIBUTION NOTE: Mandiant ties the webshell campaign to CVE-2026-88772 (DTLS); ORG's confirmed 9/10–9/12 activity is 88771. Both CVEs live; post-ex looks identical. Targeted sectors incl. gov/financial/tech/education/legal, N. America + Europe.
+SOURCES
+Citrix CTX697096 · watchTowr (88771 DAG + write-ups) · GreyNoise (Swarming / At The Edge) · Unit 42 · LevelBlue THOR · Mandiant/GTIG (Defending Against Active Exploitation — WHIPSHOT/SLAPSHOT, YARA, grep hunts) · CISA KEV.
